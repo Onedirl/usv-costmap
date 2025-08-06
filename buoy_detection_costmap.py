@@ -17,17 +17,116 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import json
 from datetime import datetime
+from pymavlink import mavutil
+import math
+
+@dataclass
+class GlobalPosition:
+    """Global koordinat sistemi pozisyonu"""
+    latitude: float  # derece
+    longitude: float  # derece
+    altitude: float  # metre (deniz seviyesinden)
+    timestamp: float
+
+@dataclass
+class IMUData:
+    """IMU sensor verisi"""
+    roll: float  # radyan
+    pitch: float  # radyan
+    yaw: float  # radyan (kuzeyden saat yönü)
+    timestamp: float
 
 @dataclass
 class Buoy:
-    """Duba veri yapısı"""
+    """Duba veri yapısı - Global koordinat destekli"""
     id: int
     color: str  # 'yellow' veya 'orange'
-    position_3d: np.ndarray  # [x, y, z] metre cinsinden
+    position_3d_local: np.ndarray  # [x, y, z] kamera koordinatlarında
+    position_global: Optional[GlobalPosition]  # Global koordinatlarda pozisyon
     position_2d: Tuple[int, int]  # Görüntüdeki piksel konumu
     confidence: float
     timestamp: float
     last_seen: float
+    detection_count: int = 1  # Kaç kez tespit edildi
+
+class GlobalCoordinateTransform:
+    """Global koordinat dönüşümü sınıfı"""
+    def __init__(self):
+        self.origin_lat = None
+        self.origin_lon = None
+        self.origin_alt = None
+        self.initialized = False
+        
+        # Earth radius in meters
+        self.earth_radius = 6378137.0
+        
+    def set_origin(self, lat: float, lon: float, alt: float):
+        """Referans noktasını ayarla (ilk GPS konumu)"""
+        self.origin_lat = lat
+        self.origin_lon = lon
+        self.origin_alt = alt
+        self.initialized = True
+        print(f"Global koordinat origin ayarlandı: {lat:.6f}, {lon:.6f}, {alt:.1f}m")
+    
+    def local_to_global(self, local_pos: np.ndarray, current_gps: GlobalPosition, 
+                       current_imu: IMUData) -> GlobalPosition:
+        """
+        Yerel kamera koordinatlarını global koordinatlara çevir
+        local_pos: [x, y, z] kamera koordinatlarında (x:ileri, y:sol, z:yukarı)
+        """
+        if not self.initialized:
+            # İlk GPS konumunu origin olarak ayarla
+            self.set_origin(current_gps.latitude, current_gps.longitude, current_gps.altitude)
+        
+        # Kamera koordinatlarını gemi koordinat sistemine çevir
+        # ZED kamera: x=sağ, y=aşağı, z=ileri
+        # Gemi: x=ileri, y=sol, z=yukarı olacak şekilde dönüştür
+        x_ship = local_pos[2]  # kamera z -> gemi x (ileri)
+        y_ship = -local_pos[0]  # kamera -x -> gemi y (sol)
+        z_ship = -local_pos[1]  # kamera -y -> gemi z (yukarı)
+        
+        # IMU yaw açısına göre döndür (gemi yönü)
+        cos_yaw = math.cos(current_imu.yaw)
+        sin_yaw = math.sin(current_imu.yaw)
+        
+        # Döndürülmüş koordinatlar (NED - North East Down)
+        x_ned = x_ship * cos_yaw - y_ship * sin_yaw  # Kuzey
+        y_ned = x_ship * sin_yaw + y_ship * cos_yaw  # Doğu
+        z_ned = z_ship  # Aşağı (derinlik)
+        
+        # NED koordinatlarını GPS'e çevir
+        dlat = x_ned / self.earth_radius * 180.0 / math.pi
+        dlon = y_ned / (self.earth_radius * math.cos(math.radians(current_gps.latitude))) * 180.0 / math.pi
+        
+        global_lat = current_gps.latitude + dlat
+        global_lon = current_gps.longitude + dlon
+        global_alt = current_gps.altitude - z_ned  # Deniz seviyesinden yükseklik
+        
+        return GlobalPosition(
+            latitude=global_lat,
+            longitude=global_lon, 
+            altitude=global_alt,
+            timestamp=time.time()
+        )
+    
+    def calculate_distance(self, pos1: GlobalPosition, pos2: GlobalPosition) -> float:
+        """İki global pozisyon arasındaki mesafeyi hesapla (Haversine formula)"""
+        lat1, lon1 = math.radians(pos1.latitude), math.radians(pos1.longitude)
+        lat2, lon2 = math.radians(pos2.latitude), math.radians(pos2.longitude)
+        
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        
+        a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+        c = 2 * math.asin(math.sqrt(a))
+        distance = self.earth_radius * c
+        
+        # Yükseklik farkını da ekle
+        if pos1.altitude is not None and pos2.altitude is not None:
+            dalt = pos2.altitude - pos1.altitude
+            distance = math.sqrt(distance**2 + dalt**2)
+            
+        return distance
 
 class CostMapManager:
     """Cost Map yönetim sınıfı"""
@@ -86,8 +185,8 @@ class CostMapManager:
         return 0
 
 class BuoyDetectionSystem:
-    """YOLO tabanlı duba tespit sistemi"""
-    def __init__(self, model_path: str):
+    """YOLO tabanlı duba tespit sistemi - Global koordinat destekli"""
+    def __init__(self, model_path: str, mavlink_connection: str = None):
         # YOLO modeli yükle
         self.model = YOLO(model_path)
         
@@ -98,9 +197,25 @@ class BuoyDetectionSystem:
         # Cost map yöneticisi
         self.cost_map_manager = CostMapManager()
         
-        # Duba takibi
+        # Global koordinat sistemi
+        self.coordinate_transform = GlobalCoordinateTransform()
+        
+        # MAVLink bağlantısı (opsiyonel)
+        self.mavlink_connection = mavlink_connection
+        self.mavlink = None
+        if mavlink_connection:
+            self.init_mavlink(mavlink_connection)
+        
+        # Mevcut GPS ve IMU verileri
+        self.current_gps = None
+        self.current_imu = None
+        self.last_gps_time = 0
+        self.last_imu_time = 0
+        
+        # Duba takibi - Global koordinat destekli
         self.buoys = {}  # ID -> Buoy
         self.next_buoy_id = 0
+        self.global_buoy_threshold = 3.0  # Global koordinatlarda minimum mesafe (metre)
         
         # Thread güvenliği için
         self.lock = threading.Lock()
@@ -136,6 +251,75 @@ class BuoyDetectionSystem:
         self.point_cloud = sl.Mat()
         
         print("ZED 2i kamera başarıyla başlatıldı!")
+    
+    def init_mavlink(self, connection_string: str):
+        """MAVLink bağlantısını başlat"""
+        try:
+            self.mavlink = mavutil.mavlink_connection(connection_string)
+            print("MAVLink bağlantısı kuruluyor...")
+            self.mavlink.wait_heartbeat()
+            print("✓ MAVLink bağlantısı başarılı!")
+        except Exception as e:
+            print(f"⚠ MAVLink bağlantısı kurulamadı: {e}")
+            print("  GPS/IMU verileri olmadan devam ediliyor...")
+            self.mavlink = None
+    
+    def update_gps_data(self) -> bool:
+        """GPS verilerini güncelle"""
+        if not self.mavlink:
+            return False
+            
+        try:
+            # GPS verisi al (non-blocking)
+            gps_msg = self.mavlink.recv_match(type='GPS_RAW_INT', blocking=False)
+            if gps_msg and gps_msg.fix_type >= 3:  # 3D Fix gerekli
+                self.current_gps = GlobalPosition(
+                    latitude=gps_msg.lat / 1e7,  # mikro derece -> derece
+                    longitude=gps_msg.lon / 1e7,
+                    altitude=gps_msg.alt / 1000.0,  # mm -> metre
+                    timestamp=time.time()
+                )
+                self.last_gps_time = time.time()
+                return True
+        except Exception as e:
+            print(f"GPS veri hatası: {e}")
+        
+        return False
+    
+    def update_imu_data(self) -> bool:
+        """IMU verilerini güncelle"""
+        if not self.mavlink:
+            return False
+            
+        try:
+            # Attitude verisi al (roll, pitch, yaw)
+            attitude_msg = self.mavlink.recv_match(type='ATTITUDE', blocking=False)
+            if attitude_msg:
+                self.current_imu = IMUData(
+                    roll=attitude_msg.roll,
+                    pitch=attitude_msg.pitch,
+                    yaw=attitude_msg.yaw,
+                    timestamp=time.time()
+                )
+                self.last_imu_time = time.time()
+                return True
+        except Exception as e:
+            print(f"IMU veri hatası: {e}")
+        
+        return False
+    
+    def has_valid_navigation_data(self) -> bool:
+        """Geçerli GPS ve IMU verisi var mı kontrol et"""
+        current_time = time.time()
+        gps_timeout = 2.0  # saniye
+        imu_timeout = 1.0  # saniye
+        
+        gps_valid = (self.current_gps is not None and 
+                    (current_time - self.last_gps_time) < gps_timeout)
+        imu_valid = (self.current_imu is not None and 
+                    (current_time - self.last_imu_time) < imu_timeout)
+        
+        return gps_valid and imu_valid
         
     def detect_buoys(self, frame: np.ndarray) -> List[dict]:
         """YOLO ile duba tespiti"""
@@ -181,62 +365,125 @@ class BuoyDetectionSystem:
         return None
     
     def update_buoy_tracking(self, detections: List[dict]):
-        """Duba takibini güncelle"""
+        """Global koordinat destekli duba takibini güncelle"""
         current_time = time.time()
         
+        # GPS ve IMU verilerini güncelle
+        self.update_gps_data()
+        self.update_imu_data()
+        
         with self.lock:
-            # Mevcut dubaları işaretle
-            for buoy_id in self.buoys:
-                self.buoys[buoy_id].last_seen = current_time
-            
             # Yeni tespitleri işle
             for det in detections:
                 center_x, center_y = det['center']
-                position_3d = self.get_3d_position(center_x, center_y)
+                position_3d_local = self.get_3d_position(center_x, center_y)
                 
-                if position_3d is not None:
-                    # En yakın mevcut dubayı bul
-                    min_distance = float('inf')
-                    matched_id = None
+                if position_3d_local is not None:
+                    # Global koordinata çevir (eğer GPS/IMU verisi varsa)
+                    global_position = None
+                    if self.has_valid_navigation_data():
+                        try:
+                            global_position = self.coordinate_transform.local_to_global(
+                                position_3d_local, self.current_gps, self.current_imu
+                            )
+                        except Exception as e:
+                            print(f"Global koordinat dönüşüm hatası: {e}")
                     
-                    for buoy_id, buoy in self.buoys.items():
-                        distance = np.linalg.norm(position_3d - buoy.position_3d)
-                        if distance < 2.0 and distance < min_distance:  # 2 metre eşik
-                            min_distance = distance
-                            matched_id = buoy_id
+                    # Mevcut dubalar arasında eşleştirme ara
+                    matched_buoy_id = self.find_matching_buoy(position_3d_local, global_position)
                     
-                    if matched_id is not None:
+                    if matched_buoy_id is not None:
                         # Mevcut dubayı güncelle
-                        self.buoys[matched_id].position_3d = position_3d
-                        self.buoys[matched_id].position_2d = (center_x, center_y)
-                        self.buoys[matched_id].confidence = det['confidence']
-                        self.buoys[matched_id].timestamp = current_time
-                        self.buoys[matched_id].last_seen = current_time
+                        buoy = self.buoys[matched_buoy_id]
+                        buoy.position_3d_local = position_3d_local
+                        buoy.position_2d = (center_x, center_y)
+                        buoy.confidence = det['confidence']
+                        buoy.timestamp = current_time
+                        buoy.last_seen = current_time
+                        buoy.detection_count += 1
+                        
+                        # Global pozisyonu da güncelle
+                        if global_position:
+                            buoy.position_global = global_position
+                            
+                        print(f"Duba ID:{matched_buoy_id} güncellendi (toplam {buoy.detection_count} tespit)")
                     else:
                         # Yeni duba ekle
                         new_buoy = Buoy(
                             id=self.next_buoy_id,
                             color=det['class'],
-                            position_3d=position_3d,
+                            position_3d_local=position_3d_local,
+                            position_global=global_position,
                             position_2d=(center_x, center_y),
                             confidence=det['confidence'],
                             timestamp=current_time,
-                            last_seen=current_time
+                            last_seen=current_time,
+                            detection_count=1
                         )
                         self.buoys[self.next_buoy_id] = new_buoy
+                        
+                        # Global koordinat bilgisi yazdır
+                        if global_position:
+                            print(f"YENİ DUBA eklenildi - ID:{self.next_buoy_id}")
+                            print(f"  Lokal: [{position_3d_local[0]:.1f}, {position_3d_local[1]:.1f}, {position_3d_local[2]:.1f}] m")
+                            print(f"  Global: {global_position.latitude:.6f}, {global_position.longitude:.6f}")
+                        else:
+                            print(f"YENİ DUBA eklenildi - ID:{self.next_buoy_id} (sadece lokal koordinat)")
+                        
                         self.next_buoy_id += 1
                         
-                        # Cost map'e ekle
+                        # Cost map'e ekle (lokal koordinatlarla)
                         self.cost_map_manager.add_buoy_to_map(new_buoy)
             
             # Uzun süredir görülmeyen dubaları temizle
-            buoys_to_remove = []
-            for buoy_id, buoy in self.buoys.items():
-                if current_time - buoy.last_seen > 10.0:  # 10 saniye
-                    buoys_to_remove.append(buoy_id)
+            self.cleanup_old_buoys(current_time)
+    
+    def find_matching_buoy(self, local_pos: np.ndarray, global_pos: Optional[GlobalPosition]) -> Optional[int]:
+        """
+        Yeni tespitin mevcut dubalardan hangisine ait olduğunu bul
+        Global koordinat varsa önce global, yoksa lokal koordinat kullan
+        """
+        min_distance = float('inf')
+        matched_id = None
+        
+        for buoy_id, buoy in self.buoys.items():
+            distance = float('inf')
             
-            for buoy_id in buoys_to_remove:
-                del self.buoys[buoy_id]
+            # Önce global koordinatla karşılaştır (daha güvenilir)
+            if global_pos and buoy.position_global:
+                distance = self.coordinate_transform.calculate_distance(global_pos, buoy.position_global)
+                threshold = self.global_buoy_threshold  # 3 metre
+                
+                if distance < threshold and distance < min_distance:
+                    min_distance = distance
+                    matched_id = buoy_id
+            
+            # Global koordinat yoksa lokal koordinatla karşılaştır
+            elif not global_pos or not buoy.position_global:
+                local_distance = np.linalg.norm(local_pos - buoy.position_3d_local)
+                threshold = 2.0  # 2 metre (lokal için daha dar eşik)
+                
+                if local_distance < threshold and local_distance < min_distance:
+                    min_distance = local_distance
+                    matched_id = buoy_id
+        
+        return matched_id
+    
+    def cleanup_old_buoys(self, current_time: float):
+        """Uzun süredir görülmeyen dubaları temizle"""
+        timeout = 30.0  # 30 saniye (global koordinat için daha uzun timeout)
+        buoys_to_remove = []
+        
+        for buoy_id, buoy in self.buoys.items():
+            if current_time - buoy.last_seen > timeout:
+                buoys_to_remove.append(buoy_id)
+                if buoy.position_global:
+                    print(f"Eski duba kaldırıldı - ID:{buoy_id} (Global: {buoy.position_global.latitude:.6f}, {buoy.position_global.longitude:.6f})")
+                else:
+                    print(f"Eski duba kaldırıldı - ID:{buoy_id} (Sadece lokal)")
+        
+        for buoy_id in buoys_to_remove:
+            del self.buoys[buoy_id]
     
     def process_frame(self):
         """Tek frame işleme"""
@@ -276,13 +523,26 @@ class BuoyDetectionSystem:
             cv2.putText(vis_frame, f"{det['class']} {det['confidence']:.2f}", 
                        (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         
-        # 3D pozisyonları göster
+        # 3D pozisyonları ve global koordinatları göster
         with self.lock:
             for buoy in self.buoys.values():
                 x, y = buoy.position_2d
-                text = f"ID:{buoy.id} [{buoy.position_3d[0]:.1f}m, {buoy.position_3d[1]:.1f}m]"
-                cv2.putText(vis_frame, text, (x-50, y+30), 
+                
+                # Lokal pozisyon
+                local_text = f"ID:{buoy.id} [{buoy.position_3d_local[0]:.1f}m, {buoy.position_3d_local[1]:.1f}m]"
+                cv2.putText(vis_frame, local_text, (x-50, y+30), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                
+                # Global pozisyon (varsa)
+                if buoy.position_global:
+                    global_text = f"GPS: {buoy.position_global.latitude:.6f}, {buoy.position_global.longitude:.6f}"
+                    cv2.putText(vis_frame, global_text, (x-50, y+45), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 0), 1)
+                
+                # Tespit sayısı
+                count_text = f"Tespit: {buoy.detection_count}"
+                cv2.putText(vis_frame, count_text, (x-50, y+60), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 0), 1)
         
         return vis_frame
     
@@ -297,8 +557,14 @@ class BuoyDetectionSystem:
                 {
                     'id': b.id,
                     'color': b.color,
-                    'position': b.position_3d.tolist(),
-                    'confidence': b.confidence
+                    'position_local': b.position_3d_local.tolist(),
+                    'position_global': {
+                        'latitude': b.position_global.latitude,
+                        'longitude': b.position_global.longitude,
+                        'altitude': b.position_global.altitude
+                    } if b.position_global else None,
+                    'confidence': b.confidence,
+                    'detection_count': b.detection_count
                 }
                 for b in self.buoys.values()
             ]
@@ -372,8 +638,22 @@ def main():
     # YOLO model yolu - kendi modelinizin yolunu buraya yazın
     MODEL_PATH = "path/to/your/buoy_model.pt"  # Değiştirin!
     
+    # MAVLink bağlantısı (opsiyonel - GPS/IMU için)
+    # Örnek bağlantı stringleri:
+    # MAVLINK_CONNECTION = "/dev/ttyUSB0"  # Serial
+    # MAVLINK_CONNECTION = "udp:127.0.0.1:14550"  # UDP
+    # MAVLINK_CONNECTION = "tcp:127.0.0.1:5760"  # TCP
+    MAVLINK_CONNECTION = None  # None = sadece kamera verileri kullan
+    
+    print("=== USV Duba Tespiti - Global Koordinat Destekli ===")
+    if MAVLINK_CONNECTION:
+        print(f"MAVLink bağlantısı: {MAVLINK_CONNECTION}")
+        print("GPS/IMU verileri ile global koordinat desteği aktif")
+    else:
+        print("Sadece kamera verileri kullanılıyor (lokal koordinat)")
+    
     # Sistemi başlat
-    detection_system = BuoyDetectionSystem(MODEL_PATH)
+    detection_system = BuoyDetectionSystem(MODEL_PATH, MAVLINK_CONNECTION)
     detection_system.run()
 
 if __name__ == "__main__":

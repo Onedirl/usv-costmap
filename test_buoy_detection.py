@@ -2,6 +2,7 @@
 """
 Duba tespit sistemini test etme scripti
 Kamera veya video dosyası ile test yapabilirsiniz
+Global koordinat simülasyonu destekli
 """
 
 import cv2
@@ -9,14 +10,18 @@ import numpy as np
 from ultralytics import YOLO
 import time
 import argparse
+import math
+import json
+from datetime import datetime
 
 class SimpleBuoyDetectionTest:
-    """Basit duba tespit test sınıfı (ZED kamera olmadan)"""
+    """Basit duba tespit test sınıfı - Global koordinat simülasyonu destekli"""
     
-    def __init__(self, model_path: str, video_source=0):
+    def __init__(self, model_path: str, video_source=0, simulate_gps=False):
         """
         model_path: YOLO model dosyası
         video_source: 0 (webcam) veya video dosya yolu
+        simulate_gps: GPS/IMU simülasyonu yap
         """
         self.model = YOLO(model_path)
         self.cap = cv2.VideoCapture(video_source)
@@ -24,6 +29,20 @@ class SimpleBuoyDetectionTest:
         # Test cost map (basit 2D grid)
         self.simple_cost_map = np.zeros((100, 100), dtype=np.float32)
         self.map_scale = 10  # piksel/metre
+        
+        # Global koordinat simülasyonu
+        self.simulate_gps = simulate_gps
+        self.simulated_gps = {
+            'lat': 41.0082,  # İstanbul koordinatları (örnek)
+            'lon': 28.9784,
+            'alt': 10.0,
+            'yaw': 0.0  # radyan
+        }
+        
+        # Tespit edilen dubaların global koordinatları
+        self.global_buoys = {}  # ID -> {"lat": ..., "lon": ..., "count": ...}
+        self.buoy_id_counter = 0
+        self.global_threshold = 5.0  # metre
         
     def detect_buoys(self, frame):
         """YOLO ile duba tespiti"""
@@ -48,6 +67,119 @@ class SimpleBuoyDetectionTest:
                             'class': 'yellow' if 'yellow' in class_name.lower() else 'orange',
                             'center': (int((x1+x2)/2), int((y1+y2)/2))
                         })
+        
+        return detections
+    
+    def simulate_vehicle_movement(self, frame_count):
+        """Araç hareketini simüle et (GPS değişimi)"""
+        if not self.simulate_gps:
+            return
+            
+        # Basit dairesel hareket simülasyonu
+        t = frame_count * 0.1  # zaman
+        radius = 0.0005  # ~50 metre
+        
+        # Merkez etrafında dönüş
+        self.simulated_gps['lat'] = 41.0082 + radius * math.cos(t)
+        self.simulated_gps['lon'] = 28.9784 + radius * math.sin(t)
+        self.simulated_gps['yaw'] = t * 0.5  # Yavaş dönüş
+        
+    def local_to_global_simple(self, pixel_x, pixel_y, frame_shape):
+        """Basit piksel koordinatını global koordinata çevir"""
+        if not self.simulate_gps:
+            return None
+            
+        # Kamera görüş alanını simüle et (örnek: 60 derece)
+        frame_center_x = frame_shape[1] / 2
+        frame_center_y = frame_shape[0] / 2
+        
+        # Pikseli metre cinsine çevir (yaklaşık)
+        meters_per_pixel = 0.1  # Her piksel ~10cm temsil ediyor
+        x_meters = (pixel_x - frame_center_x) * meters_per_pixel
+        y_meters = (pixel_y - frame_center_y) * meters_per_pixel
+        
+        # Araç yönüne göre döndür
+        cos_yaw = math.cos(self.simulated_gps['yaw'])
+        sin_yaw = math.sin(self.simulated_gps['yaw'])
+        
+        x_rotated = x_meters * cos_yaw - y_meters * sin_yaw
+        y_rotated = x_meters * sin_yaw + y_meters * cos_yaw
+        
+        # Global koordinata çevir (basit)
+        earth_radius = 6378137.0
+        dlat = x_rotated / earth_radius * 180.0 / math.pi
+        dlon = y_rotated / (earth_radius * math.cos(math.radians(self.simulated_gps['lat']))) * 180.0 / math.pi
+        
+        global_lat = self.simulated_gps['lat'] + dlat
+        global_lon = self.simulated_gps['lon'] + dlon
+        
+        return {'lat': global_lat, 'lon': global_lon}
+    
+    def calculate_distance(self, pos1, pos2):
+        """İki global pozisyon arasındaki mesafe (Haversine)"""
+        lat1, lon1 = math.radians(pos1['lat']), math.radians(pos1['lon'])
+        lat2, lon2 = math.radians(pos2['lat']), math.radians(pos2['lon'])
+        
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        
+        a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+        c = 2 * math.asin(math.sqrt(a))
+        return 6378137.0 * c  # metre
+    
+    def find_matching_global_buoy(self, global_pos):
+        """Global koordinatta eşleşen dubayı bul"""
+        if not global_pos:
+            return None
+            
+        min_distance = float('inf')
+        matched_id = None
+        
+        for buoy_id, buoy_data in self.global_buoys.items():
+            distance = self.calculate_distance(global_pos, buoy_data)
+            if distance < self.global_threshold and distance < min_distance:
+                min_distance = distance
+                matched_id = buoy_id
+                
+        return matched_id
+    
+    def update_global_buoys(self, detections, frame_shape):
+        """Global duba takibini güncelle"""
+        if not self.simulate_gps:
+            return
+            
+        for det in detections:
+            center_x, center_y = det['center']
+            
+            # Global koordinata çevir
+            global_pos = self.local_to_global_simple(center_x, center_y, frame_shape)
+            if global_pos:
+                # Mevcut dubada eşleştirme ara
+                matched_id = self.find_matching_global_buoy(global_pos)
+                
+                if matched_id is not None:
+                    # Mevcut dubayı güncelle
+                    self.global_buoys[matched_id]['count'] += 1
+                    # Pozisyonu güncelle (ortalaması)
+                    old_count = self.global_buoys[matched_id]['count'] - 1
+                    self.global_buoys[matched_id]['lat'] = (
+                        self.global_buoys[matched_id]['lat'] * old_count + global_pos['lat']
+                    ) / self.global_buoys[matched_id]['count']
+                    self.global_buoys[matched_id]['lon'] = (
+                        self.global_buoys[matched_id]['lon'] * old_count + global_pos['lon']
+                    ) / self.global_buoys[matched_id]['count']
+                else:
+                    # Yeni duba ekle
+                    self.global_buoys[self.buoy_id_counter] = {
+                        'lat': global_pos['lat'],
+                        'lon': global_pos['lon'],
+                        'color': det['class'],
+                        'count': 1,
+                        'first_seen': time.time()
+                    }
+                    print(f"YENİ GLOBAL DUBA - ID:{self.buoy_id_counter} "
+                          f"({global_pos['lat']:.6f}, {global_pos['lon']:.6f})")
+                    self.buoy_id_counter += 1
         
         return detections
     
@@ -96,9 +228,24 @@ class SimpleBuoyDetectionTest:
             cv2.circle(vis_frame, (cx, cy), 5, color, -1)
         
         # Tespit sayısı
-        info_text = f"Tespit: {len(detections)} duba"
+        info_text = f"Lokal tespit: {len(detections)}"
         cv2.putText(vis_frame, info_text, (10, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        # Global duba sayısı
+        if self.simulate_gps:
+            global_text = f"Global dubalar: {len(self.global_buoys)}"
+            cv2.putText(vis_frame, global_text, (10, 60), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+            
+            # GPS simülasyon bilgisi
+            gps_text = f"GPS: {self.simulated_gps['lat']:.6f}, {self.simulated_gps['lon']:.6f}"
+            cv2.putText(vis_frame, gps_text, (10, 90), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            
+            yaw_text = f"Yaw: {math.degrees(self.simulated_gps['yaw']):.1f}°"
+            cv2.putText(vis_frame, yaw_text, (10, 110), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
         
         return vis_frame
     
@@ -142,8 +289,14 @@ class SimpleBuoyDetectionTest:
                 fps = 30 / (time.time() - start_time)
                 start_time = time.time()
             
+            # Araç hareketini simüle et
+            self.simulate_vehicle_movement(frame_count)
+            
             # Duba tespiti
             detections = self.detect_buoys(frame)
+            
+            # Global koordinat güncellemesi
+            self.update_global_buoys(detections, frame.shape)
             
             # Cost map güncelle
             self.update_simple_cost_map(detections, frame.shape)
@@ -172,7 +325,19 @@ class SimpleBuoyDetectionTest:
                 timestamp = int(time.time())
                 cv2.imwrite(f"buoy_detection_{timestamp}.jpg", vis_frame)
                 cv2.imwrite(f"cost_map_{timestamp}.jpg", self.visualize_cost_map())
-                print(f"Görüntüler kaydedildi!")
+                
+                # Global duba verilerini kaydet
+                if self.simulate_gps and self.global_buoys:
+                    global_data = {
+                        'timestamp': datetime.now().isoformat(),
+                        'vehicle_position': self.simulated_gps,
+                        'global_buoys': self.global_buoys
+                    }
+                    with open(f"global_buoys_{timestamp}.json", 'w') as f:
+                        json.dump(global_data, f, indent=2)
+                    print(f"Görüntüler ve global veriler kaydedildi!")
+                else:
+                    print(f"Görüntüler kaydedildi!")
             elif key == ord('c'):
                 show_cost_map = not show_cost_map
                 if not show_cost_map:
@@ -266,6 +431,8 @@ def main():
                        help='Video kaynağı (0=webcam, veya video dosyası)')
     parser.add_argument('--create-synthetic', action='store_true',
                        help='Test için sentetik video oluştur')
+    parser.add_argument('--simulate-gps', action='store_true',
+                       help='GPS/IMU simülasyonu ile global koordinat testi')
     
     args = parser.parse_args()
     
@@ -280,7 +447,14 @@ def main():
         if args.source.isdigit():
             args.source = int(args.source)
         
-        tester = SimpleBuoyDetectionTest(args.model, args.source)
+        print("=== Duba Tespit Sistemi - Test Modu ===")
+        if args.simulate_gps:
+            print("GPS/IMU simülasyonu aktif - Global koordinat testi")
+            print("Araç hareketi simüle edilecek, aynı dubalar tekrar tespit edilmeyecek")
+        else:
+            print("Sadece lokal tespit - Global koordinat yok")
+        
+        tester = SimpleBuoyDetectionTest(args.model, args.source, args.simulate_gps)
         tester.run()
         
     except Exception as e:
