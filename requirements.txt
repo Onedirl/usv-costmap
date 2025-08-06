@@ -1,0 +1,30 @@
+# USV Duba Tespiti ve Cost Map Sistemi Gereksinimleri
+
+# Temel kütüphaneler
+numpy==1.24.3
+opencv-python==4.8.1.78
+matplotlib==3.7.2
+
+# YOLO v8 için
+ultralytics==8.0.200
+torch>=2.0.0
+torchvision>=0.15.0
+
+# ZED kamera SDK Python wrapper
+# NOT: ZED SDK'yı önce sistemize kurmanız gerekiyor
+# https://www.stereolabs.com/developers/release/
+pyzed
+
+# MAVLink
+pymavlink==2.4.40
+
+# Veri işleme ve kayıt
+pandas==2.0.3
+scipy==1.11.1
+
+# Görselleştirme
+seaborn==0.12.2
+plotly==5.15.0
+
+# Threading ve async işlemler için
+asyncio
