@@ -144,3 +144,9 @@ Bu proje eğitim amaçlıdır. Ticari kullanım için uygun lisansları kontrol 
 ## 📞 Destek
 
 Sorularınız için issue açabilir veya dokümantasyonu inceleyebilirsiniz.
+python /home/onedir/halildeneme/buoy_detection_costmap.py \
+  --model path/to/your/buoy_model.pt \
+  --mavlink /dev/ttyUSB0 --baud 57600 \
+  --headless \
+  --save-json-interval 30 \
+  --save-dir /home/onedir/kayitlar

@@ -1,3 +1,4 @@
+# /home/onedir/halildeneme/buoy_detection_costmap.py
 #!/usr/bin/env python3
 """
 USV Duba Tespiti ve Cost Map Oluşturma Sistemi
@@ -19,6 +20,8 @@ import json
 from datetime import datetime
 from pymavlink import mavutil
 import math
+import argparse
+import os
 
 @dataclass
 class GlobalPosition:
@@ -48,6 +51,13 @@ class Buoy:
     timestamp: float
     last_seen: float
     detection_count: int = 1  # Kaç kez tespit edildi
+    # Takip alanları
+    xy_enu: Optional[Tuple[float, float]] = None
+    kf_state: Optional[np.ndarray] = None   # [x, y, vx, vy]
+    kf_P: Optional[np.ndarray] = None       # 4x4 kovaryans
+    hits: int = 1
+    misses: int = 0
+    confirmed: bool = False
 
 class GlobalCoordinateTransform:
     """Global koordinat dönüşümü sınıfı"""
@@ -128,6 +138,16 @@ class GlobalCoordinateTransform:
             
         return distance
 
+    def global_to_xy(self, gp: GlobalPosition) -> Tuple[float, float]:
+        """Origin'e göre yaklaşık ENU XY (metre)"""
+        if not self.initialized:
+            self.set_origin(gp.latitude, gp.longitude, gp.altitude)
+        dlat = math.radians(gp.latitude - self.origin_lat)
+        dlon = math.radians(gp.longitude - self.origin_lon)
+        x_north = dlat * self.earth_radius
+        y_east  = dlon * self.earth_radius * math.cos(math.radians(self.origin_lat))
+        return (x_north, y_east)
+
 class CostMapManager:
     """Cost Map yönetim sınıfı"""
     def __init__(self, map_size=(200, 200), resolution=0.5):
@@ -153,8 +173,8 @@ class CostMapManager:
     
     def add_buoy_to_map(self, buoy: Buoy):
         """Dubayı cost map'e ekle"""
-        # Duba pozisyonunu grid koordinatlarına çevir
-        grid_x, grid_y = self.world_to_grid(buoy.position_3d[0], buoy.position_3d[1])
+        # Duba pozisyonunu grid koordinatlarına çevir (lokal x,y)
+        grid_x, grid_y = self.world_to_grid(buoy.position_3d_local[0], buoy.position_3d_local[1])
         
         # Grid sınırları kontrolü
         if 0 <= grid_x < self.map_size[0] and 0 <= grid_y < self.map_size[1]:
@@ -186,7 +206,8 @@ class CostMapManager:
 
 class BuoyDetectionSystem:
     """YOLO tabanlı duba tespit sistemi - Global koordinat destekli"""
-    def __init__(self, model_path: str, mavlink_connection: str = None):
+    def __init__(self, model_path: str, mavlink_connection: str = None, mavlink_baud: Optional[int] = None,
+                 headless: bool = False, save_json_interval: Optional[float] = None, save_dir: Optional[str] = None):
         # YOLO modeli yükle
         self.model = YOLO(model_path)
         
@@ -202,6 +223,7 @@ class BuoyDetectionSystem:
         
         # MAVLink bağlantısı (opsiyonel)
         self.mavlink_connection = mavlink_connection
+        self.mavlink_baud = mavlink_baud or 57600
         self.mavlink = None
         if mavlink_connection:
             self.init_mavlink(mavlink_connection)
@@ -215,8 +237,22 @@ class BuoyDetectionSystem:
         # Duba takibi - Global koordinat destekli
         self.buoys = {}  # ID -> Buoy
         self.next_buoy_id = 0
-        self.global_buoy_threshold = 3.0  # Global koordinatlarda minimum mesafe (metre)
+
+        # Takip parametreleri
+        self.confirm_hits = 2
+        self.max_age_s = 2.0
+        self.class_base_radius = {'orange': 0.6, 'yellow': 1.2}
+        self.radius_min = 0.5
+        self.radius_max = 2.5
+        self.mahalanobis_gate = 5.0  # ~chi2 2D
         
+        # Headless ve otomatik kayıt ayarları
+        self.headless = headless
+        self.save_json_interval = save_json_interval
+        self.save_dir = save_dir or os.getcwd()
+        os.makedirs(self.save_dir, exist_ok=True)
+        self._last_json_save_ts = 0.0
+
         # Thread güvenliği için
         self.lock = threading.Lock()
         self.detection_queue = Queue()
@@ -255,14 +291,39 @@ class BuoyDetectionSystem:
     def init_mavlink(self, connection_string: str):
         """MAVLink bağlantısını başlat"""
         try:
-            self.mavlink = mavutil.mavlink_connection(connection_string)
+            # Seri ise baud ile bağlan, UDP/TCP ise doğrudan
+            if connection_string.startswith('/dev') or connection_string.lower().startswith('com'):
+                self.mavlink = mavutil.mavlink_connection(connection_string, baud=self.mavlink_baud)
+            else:
+                self.mavlink = mavutil.mavlink_connection(connection_string)
             print("MAVLink bağlantısı kuruluyor...")
             self.mavlink.wait_heartbeat()
             print("✓ MAVLink bağlantısı başarılı!")
+
+            # Mesaj aralıklarını iste (10 Hz)
+            try:
+                self._set_message_interval(33, 100000)  # GLOBAL_POSITION_INT
+                self._set_message_interval(30, 100000)  # ATTITUDE
+            except Exception:
+                pass
         except Exception as e:
             print(f"⚠ MAVLink bağlantısı kurulamadı: {e}")
             print("  GPS/IMU verileri olmadan devam ediliyor...")
             self.mavlink = None
+
+    def _set_message_interval(self, msg_id: int, interval_us: int):
+        """Otopilottan belirli mesajı belirli sıklıkta yayınlamasını iste."""
+        if not self.mavlink:
+            return
+        self.mavlink.mav.command_long_send(
+            self.mavlink.target_system,
+            self.mavlink.target_component,
+            mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+            0,
+            msg_id,
+            float(interval_us),
+            0, 0, 0, 0, 0
+        )
     
     def update_gps_data(self) -> bool:
         """GPS verilerini güncelle"""
@@ -270,13 +331,25 @@ class BuoyDetectionSystem:
             return False
             
         try:
-            # GPS verisi al (non-blocking)
-            gps_msg = self.mavlink.recv_match(type='GPS_RAW_INT', blocking=False)
-            if gps_msg and gps_msg.fix_type >= 3:  # 3D Fix gerekli
+            # Önce GLOBAL_POSITION_INT dene (lat/lon/alt içerir)
+            gpi = self.mavlink.recv_match(type='GLOBAL_POSITION_INT', blocking=False)
+            if gpi:
                 self.current_gps = GlobalPosition(
-                    latitude=gps_msg.lat / 1e7,  # mikro derece -> derece
+                    latitude=gpi.lat / 1e7,
+                    longitude=gpi.lon / 1e7,
+                    altitude=gpi.alt / 1000.0,
+                    timestamp=time.time()
+                )
+                self.last_gps_time = time.time()
+                return True
+
+            # Sonra GPS_RAW_INT dene
+            gps_msg = self.mavlink.recv_match(type='GPS_RAW_INT', blocking=False)
+            if gps_msg and getattr(gps_msg, 'fix_type', 0) >= 3:
+                self.current_gps = GlobalPosition(
+                    latitude=gps_msg.lat / 1e7,
                     longitude=gps_msg.lon / 1e7,
-                    altitude=gps_msg.alt / 1000.0,  # mm -> metre
+                    altitude=gps_msg.alt / 1000.0,
                     timestamp=time.time()
                 )
                 self.last_gps_time = time.time()
@@ -363,6 +436,73 @@ class BuoyDetectionSystem:
                 return point3D
                 
         return None
+
+    def get_3d_position_from_bbox(self, bbox: List[int]) -> Optional[np.ndarray]:
+        """BBox içinden medyan 3B nokta (gürültüye dayanıklı)"""
+        x1, y1, x2, y2 = bbox
+        x1 = max(0, x1); y1 = max(0, y1)
+        x2 = min(self.image.get_width()-1, x2)
+        y2 = min(self.image.get_height()-1, y2)
+        xs, ys, zs = [], [], []
+        step = max(1, (max(1, (x2 - x1)) // 8))
+        for yy in range(y1, y2, step):
+            for xx in range(x1, x2, step):
+                err, val = self.point_cloud.get_value(xx, yy)
+                if err == sl.ERROR_CODE.SUCCESS:
+                    X, Y, Z = float(val[0]), float(val[1]), float(val[2])
+                    if np.isfinite(X) and np.isfinite(Y) and np.isfinite(Z) and (0.3 <= Z <= 60.0):
+                        xs.append(X); ys.append(Y); zs.append(Z)
+        if len(zs) < 5:
+            return None
+        mx = float(np.median(xs)); my = float(np.median(ys)); mz = float(np.median(zs))
+        return np.array([mx, my, mz], dtype=np.float32)
+
+    # KF yardımcıları
+    def _init_kf(self, xy: Tuple[float, float]) -> Tuple[np.ndarray, np.ndarray]:
+        x, y = xy
+        state = np.array([x, y, 0.0, 0.0], dtype=np.float32)
+        P = np.diag([1.0, 1.0, 10.0, 10.0]).astype(np.float32)
+        return state, P
+
+    def _kf_predict(self, buoy: Buoy, dt: float):
+        if buoy.kf_state is None:
+            return
+        F = np.array([[1,0,dt,0],
+                      [0,1,0,dt],
+                      [0,0,1, 0],
+                      [0,0,0, 1]], dtype=np.float32)
+        q = 0.5
+        G = np.array([[0.5*dt*dt, 0],[0,0.5*dt*dt],[dt,0],[0,dt]], dtype=np.float32)
+        Q = (q*q) * (G @ G.T)
+        buoy.kf_state = F @ buoy.kf_state
+        buoy.kf_P = F @ buoy.kf_P @ F.T + Q
+
+    def _kf_update(self, buoy: Buoy, z_xy: Tuple[float, float]):
+        if buoy.kf_state is None:
+            return
+        H = np.array([[1,0,0,0],[0,1,0,0]], dtype=np.float32)
+        r = 0.5  # metre
+        R = np.eye(2, dtype=np.float32) * (r*r)
+        z = np.array(z_xy, dtype=np.float32)
+        y = z - (H @ buoy.kf_state)
+        S = H @ buoy.kf_P @ H.T + R
+        K = buoy.kf_P @ H.T @ np.linalg.inv(S)
+        buoy.kf_state = buoy.kf_state + K @ y
+        I = np.eye(4, dtype=np.float32)
+        buoy.kf_P = (I - K @ H) @ buoy.kf_P
+
+    def _predict_xy(self, buoy: Buoy, now_t: float) -> Tuple[float, float]:
+        dt = max(0.0, now_t - buoy.last_seen)
+        if buoy.kf_state is None or buoy.kf_P is None:
+            return buoy.xy_enu if buoy.xy_enu is not None else (0.0, 0.0)
+        F = np.array([[1,0,dt,0],[0,1,0,dt],[0,0,1,0],[0,0,0,1]], dtype=np.float32)
+        pred = F @ buoy.kf_state
+        return float(pred[0]), float(pred[1])
+
+    def _dynamic_radius(self, color: str, range_m: float) -> float:
+        base = self.class_base_radius.get(color, 1.0)
+        rad = base + 0.01 * max(0.0, range_m)
+        return max(self.radius_min, min(self.radius_max, rad))
     
     def update_buoy_tracking(self, detections: List[dict]):
         """Global koordinat destekli duba takibini güncelle"""
@@ -371,107 +511,142 @@ class BuoyDetectionSystem:
         # GPS ve IMU verilerini güncelle
         self.update_gps_data()
         self.update_imu_data()
-        
+
+        measurements = []
+        for det in detections:
+            bbox = det['bbox']
+            pos3d = self.get_3d_position_from_bbox(bbox)
+            if pos3d is None:
+                continue
+            gp = None
+            xy = None
+            if self.has_valid_navigation_data():
+                try:
+                    gp = self.coordinate_transform.local_to_global(pos3d, self.current_gps, self.current_imu)
+                    xy = self.coordinate_transform.global_to_xy(gp)
+                except Exception:
+                    gp = None
+                    xy = None
+            measurements.append({
+                'class': det['class'],
+                'conf': det['confidence'],
+                'pos3d': pos3d,
+                'gp': gp,
+                'xy': xy,
+                'center': det['center'],
+                'bbox': bbox,
+                'range_m': float(np.linalg.norm(pos3d))
+            })
+
         with self.lock:
-            # Yeni tespitleri işle
-            for det in detections:
-                center_x, center_y = det['center']
-                position_3d_local = self.get_3d_position(center_x, center_y)
-                
-                if position_3d_local is not None:
-                    # Global koordinata çevir (eğer GPS/IMU verisi varsa)
-                    global_position = None
-                    if self.has_valid_navigation_data():
+            matched_ids = set()
+            used_buoys = set()
+
+            # Eşleştirme: yüksek güven sırasıyla
+            for m in sorted(measurements, key=lambda x: x['conf'], reverse=True):
+                if m['xy'] is None:
+                    continue
+                mx, my = m['xy']
+                radius = self._dynamic_radius(m['class'], m['range_m'])
+
+                best_id = None
+                best_d = 1e9
+
+                for bid, b in self.buoys.items():
+                    if b.color != m['class'] or bid in used_buoys or b.xy_enu is None:
+                        continue
+                    px, py = self._predict_xy(b, current_time)
+                    d = math.hypot(mx - px, my - py)
+                    if d > radius:
+                        continue
+                    # Mahalanobis kapısı
+                    ok_maha = True
+                    if b.kf_P is not None and b.kf_state is not None:
+                        H = np.array([[1,0,0,0],[0,1,0,0]], dtype=np.float32)
+                        r = 0.5
+                        R = np.eye(2, dtype=np.float32) * (r*r)
+                        S = H @ b.kf_P @ H.T + R
+                        dz = np.array([mx, my], dtype=np.float32) - (H @ b.kf_state)
                         try:
-                            global_position = self.coordinate_transform.local_to_global(
-                                position_3d_local, self.current_gps, self.current_imu
-                            )
-                        except Exception as e:
-                            print(f"Global koordinat dönüşüm hatası: {e}")
-                    
-                    # Mevcut dubalar arasında eşleştirme ara
-                    matched_buoy_id = self.find_matching_buoy(position_3d_local, global_position)
-                    
-                    if matched_buoy_id is not None:
-                        # Mevcut dubayı güncelle
-                        buoy = self.buoys[matched_buoy_id]
-                        buoy.position_3d_local = position_3d_local
-                        buoy.position_2d = (center_x, center_y)
-                        buoy.confidence = det['confidence']
-                        buoy.timestamp = current_time
-                        buoy.last_seen = current_time
-                        buoy.detection_count += 1
-                        
-                        # Global pozisyonu da güncelle
-                        if global_position:
-                            buoy.position_global = global_position
-                            
-                        print(f"Duba ID:{matched_buoy_id} güncellendi (toplam {buoy.detection_count} tespit)")
-                    else:
-                        # Yeni duba ekle
-                        new_buoy = Buoy(
+                            maha = float(np.sqrt(dz.T @ np.linalg.inv(S) @ dz))
+                        except np.linalg.LinAlgError:
+                            maha = 0.0
+                        ok_maha = (maha <= self.mahalanobis_gate)
+                    if ok_maha and d < best_d:
+                        best_d = d
+                        best_id = bid
+
+                if best_id is not None:
+                    b = self.buoys[best_id]
+                    # KF predict + update
+                    self._kf_predict(b, max(0.0, current_time - b.last_seen))
+                    self._kf_update(b, (mx, my))
+                    # Alanları güncelle
+                    b.position_3d_local = m['pos3d']
+                    b.position_2d = m['center']
+                    b.confidence = m['conf']
+                    b.timestamp = current_time
+                    b.last_seen = current_time
+                    b.detection_count += 1
+                    b.position_global = m['gp'] if m['gp'] else b.position_global
+                    b.xy_enu = (mx, my)
+                    b.hits += 1
+                    b.misses = 0
+                    if not b.confirmed and b.hits >= self.confirm_hits:
+                        b.confirmed = True
+                    # Cost map'i güncelle (lokal x,y ile)
+                    try:
+                        self.cost_map_manager.add_buoy_to_map(b)
+                    except Exception:
+                        pass
+                    used_buoys.add(best_id)
+                    matched_ids.add(best_id)
+                else:
+                    # Yeni track aç
+                    if m['conf'] >= 0.5 and m['xy'] is not None:
+                        nb = Buoy(
                             id=self.next_buoy_id,
-                            color=det['class'],
-                            position_3d_local=position_3d_local,
-                            position_global=global_position,
-                            position_2d=(center_x, center_y),
-                            confidence=det['confidence'],
+                            color=m['class'],
+                            position_3d_local=m['pos3d'],
+                            position_global=m['gp'],
+                            position_2d=m['center'],
+                            confidence=m['conf'],
                             timestamp=current_time,
                             last_seen=current_time,
-                            detection_count=1
+                            detection_count=1,
+                            xy_enu=m['xy']
                         )
-                        self.buoys[self.next_buoy_id] = new_buoy
-                        
-                        # Global koordinat bilgisi yazdır
-                        if global_position:
-                            print(f"YENİ DUBA eklenildi - ID:{self.next_buoy_id}")
-                            print(f"  Lokal: [{position_3d_local[0]:.1f}, {position_3d_local[1]:.1f}, {position_3d_local[2]:.1f}] m")
-                            print(f"  Global: {global_position.latitude:.6f}, {global_position.longitude:.6f}")
-                        else:
-                            print(f"YENİ DUBA eklenildi - ID:{self.next_buoy_id} (sadece lokal koordinat)")
-                        
+                        state, P = self._init_kf(nb.xy_enu)
+                        nb.kf_state, nb.kf_P = state, P
+                        self.buoys[self.next_buoy_id] = nb
+                        # Cost map'e ekle
+                        try:
+                            self.cost_map_manager.add_buoy_to_map(nb)
+                        except Exception:
+                            pass
+                        used_buoys.add(self.next_buoy_id)
                         self.next_buoy_id += 1
-                        
-                        # Cost map'e ekle (lokal koordinatlarla)
-                        self.cost_map_manager.add_buoy_to_map(new_buoy)
-            
-            # Uzun süredir görülmeyen dubaları temizle
+
+            # Görülmeyenleri yaşlandır/temizle
+            for bid, b in list(self.buoys.items()):
+                if bid not in matched_ids:
+                    b.misses += 1
+
+            # Uzun süredir hiç görülmeyen ve doğrulanmamışları sil
+            for bid, b in list(self.buoys.items()):
+                if (current_time - b.last_seen) > self.max_age_s and not b.confirmed:
+                    del self.buoys[bid]
+
+            # Çok uzun süredir hiç görülmeyenleri (confirmed bile olsa) ayıkla
             self.cleanup_old_buoys(current_time)
     
     def find_matching_buoy(self, local_pos: np.ndarray, global_pos: Optional[GlobalPosition]) -> Optional[int]:
-        """
-        Yeni tespitin mevcut dubalardan hangisine ait olduğunu bul
-        Global koordinat varsa önce global, yoksa lokal koordinat kullan
-        """
-        min_distance = float('inf')
-        matched_id = None
-        
-        for buoy_id, buoy in self.buoys.items():
-            distance = float('inf')
-            
-            # Önce global koordinatla karşılaştır (daha güvenilir)
-            if global_pos and buoy.position_global:
-                distance = self.coordinate_transform.calculate_distance(global_pos, buoy.position_global)
-                threshold = self.global_buoy_threshold  # 3 metre
-                
-                if distance < threshold and distance < min_distance:
-                    min_distance = distance
-                    matched_id = buoy_id
-            
-            # Global koordinat yoksa lokal koordinatla karşılaştır
-            elif not global_pos or not buoy.position_global:
-                local_distance = np.linalg.norm(local_pos - buoy.position_3d_local)
-                threshold = 2.0  # 2 metre (lokal için daha dar eşik)
-                
-                if local_distance < threshold and local_distance < min_distance:
-                    min_distance = local_distance
-                    matched_id = buoy_id
-        
-        return matched_id
+        """(Artık kullanılmıyor)"""
+        return None
     
     def cleanup_old_buoys(self, current_time: float):
         """Uzun süredir görülmeyen dubaları temizle"""
-        timeout = 30.0  # 30 saniye (global koordinat için daha uzun timeout)
+        timeout = 30.0  # 30 saniye
         buoys_to_remove = []
         
         for buoy_id, buoy in self.buoys.items():
@@ -598,30 +773,32 @@ class BuoyDetectionSystem:
                 frame, detections = self.process_frame()
                 
                 if frame is not None:
-                    # Görselleştir
-                    vis_frame = self.visualize(frame, detections)
-                    
-                    # Görüntüyü göster
-                    cv2.imshow("USV Duba Tespiti", vis_frame)
-                    
-                    # Cost map'i göster
-                    if cv2.waitKey(1) & 0xFF == ord('c'):
-                        plt.figure(figsize=(10, 10))
-                        plt.imshow(self.cost_map_manager.cost_map, cmap='hot', origin='lower')
-                        plt.colorbar(label='Cost')
-                        plt.title('Cost Map')
-                        plt.xlabel('X (cells)')
-                        plt.ylabel('Y (cells)')
-                        plt.show()
-                    
-                    # Çıkış
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        break
-                    
-                    # Cost map kaydet
-                    if cv2.waitKey(1) & 0xFF == ord('s'):
-                        self.save_cost_map(f"cost_map_{int(time.time())}.json")
-                        print("Cost map kaydedildi!")
+                    if not self.headless:
+                        # Görselleştir ve ekrana bas
+                        vis_frame = self.visualize(frame, detections)
+                        cv2.imshow("USV Duba Tespiti", vis_frame)
+                        key = cv2.waitKey(1) & 0xFF
+                        if key == ord('c'):
+                            plt.figure(figsize=(10, 10))
+                            plt.imshow(self.cost_map_manager.cost_map, cmap='hot', origin='lower')
+                            plt.colorbar(label='Cost')
+                            plt.title('Cost Map')
+                            plt.xlabel('X (cells)')
+                            plt.ylabel('Y (cells)')
+                            plt.show()
+                        elif key == ord('s'):
+                            out = os.path.join(self.save_dir, f"cost_map_{int(time.time())}.json")
+                            self.save_cost_map(out)
+                            print(f"Cost map kaydedildi: {out}")
+                        elif key == ord('q'):
+                            break
+                    else:
+                        # Headless: otomatik JSON kayıt (varsa)
+                        if self.save_json_interval and (time.time() - self._last_json_save_ts) >= self.save_json_interval:
+                            out = os.path.join(self.save_dir, f"cost_map_{int(time.time())}.json")
+                            self.save_cost_map(out)
+                            self._last_json_save_ts = time.time()
+                            print(f"[HEADLESS] Cost map kaydedildi: {out}")
                         
         except KeyboardInterrupt:
             print("\nSistem durduruldu.")
@@ -630,30 +807,43 @@ class BuoyDetectionSystem:
     
     def cleanup(self):
         """Temizlik işlemleri"""
-        cv2.destroyAllWindows()
+        if not self.headless:
+            cv2.destroyAllWindows()
         self.zed.close()
         print("Sistem kapatıldı.")
 
 def main():
-    # YOLO model yolu - kendi modelinizin yolunu buraya yazın
-    MODEL_PATH = "path/to/your/buoy_model.pt"  # Değiştirin!
-    
-    # MAVLink bağlantısı (opsiyonel - GPS/IMU için)
-    # Örnek bağlantı stringleri:
-    # MAVLINK_CONNECTION = "/dev/ttyUSB0"  # Serial
-    # MAVLINK_CONNECTION = "udp:127.0.0.1:14550"  # UDP
-    # MAVLINK_CONNECTION = "tcp:127.0.0.1:5760"  # TCP
-    MAVLINK_CONNECTION = None  # None = sadece kamera verileri kullan
-    
+    parser = argparse.ArgumentParser(description="USV Duba Tespiti - ZED2i + YOLO + MAVLink")
+    parser.add_argument("--model", type=str, default="path/to/your/buoy_model.pt", help="YOLO .pt model yolu")
+    parser.add_argument("--mavlink", type=str, default=None, help="MAVLink bağlantı stringi (örn. /dev/ttyUSB0, udp:127.0.0.1:14550)")
+    parser.add_argument("--baud", type=int, default=57600, help="Seri bağlantı baud hızı")
+    parser.add_argument("--headless", action="store_true", help="Görüntü penceresiz (SSH/headless) çalışma modu")
+    parser.add_argument("--save-json-interval", type=float, default=None, help="Headless modda periyodik JSON kayıt süresi (saniye)")
+    parser.add_argument("--save-dir", type=str, default=None, help="Kayıtların yazılacağı dizin")
+    args = parser.parse_args()
+
+    MODEL_PATH = args.model
+    MAVLINK_CONNECTION = args.mavlink
+    MAVLINK_BAUD = args.baud
+    HEADLESS = args.headless
+    SAVE_JSON_INTERVAL = args.save_json_interval
+    SAVE_DIR = args.save_dir
+
     print("=== USV Duba Tespiti - Global Koordinat Destekli ===")
     if MAVLINK_CONNECTION:
-        print(f"MAVLink bağlantısı: {MAVLINK_CONNECTION}")
+        print(f"MAVLink bağlantısı: {MAVLINK_CONNECTION} (baud={MAVLINK_BAUD})")
         print("GPS/IMU verileri ile global koordinat desteği aktif")
     else:
         print("Sadece kamera verileri kullanılıyor (lokal koordinat)")
-    
-    # Sistemi başlat
-    detection_system = BuoyDetectionSystem(MODEL_PATH, MAVLINK_CONNECTION)
+
+    detection_system = BuoyDetectionSystem(
+        model_path=MODEL_PATH,
+        mavlink_connection=MAVLINK_CONNECTION,
+        mavlink_baud=MAVLINK_BAUD,
+        headless=HEADLESS,
+        save_json_interval=SAVE_JSON_INTERVAL,
+        save_dir=SAVE_DIR,
+    )
     detection_system.run()
 
 if __name__ == "__main__":
